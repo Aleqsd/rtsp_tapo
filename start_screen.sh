@@ -3,8 +3,7 @@ set -euo pipefail
 
 NAME="croquettes"
 APP_DIR="$HOME/rtsp_tapo"
-ENV_FILE="$HOME/.croquettes_env"
-LOG="$APP_DIR/boot.log"
+LOG="$APP_DIR/croquettes.log"
 
 # --- logging helper ---
 log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG" ; }
@@ -17,7 +16,7 @@ sleep 15
 
 # Minimal context dump
 log "USER=$(id -un) HOME=$HOME SHELL=$SHELL"
-log "APP_DIR=$APP_DIR ENV_FILE=$ENV_FILE"
+log "APP_DIR=$APP_DIR"
 
 # Ensure screen is installed
 if ! command -v screen >/dev/null 2>&1; then
@@ -36,15 +35,6 @@ fi
 if [ ! -d "$APP_DIR" ]; then
   log "ERROR: APP_DIR '$APP_DIR' does not exist."
   exit 1
-fi
-
-# Check env file presence (optional but recommended)
-if [ -f "$ENV_FILE" ]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  log "ENV_FILE loaded."
-else
-  log "WARN: ENV_FILE '$ENV_FILE' not found. Continuing without it."
 fi
 
 # Quick env sanity (mask secrets in logs)
@@ -68,9 +58,7 @@ else
 fi
 
 # Start a detached screen session running the loop script
-# -dmS : detached mode + session name
-# Use absolute path to avoid path resolution issues
-CMD="cd '$APP_DIR' && /bin/bash -lc 'source \"$ENV_FILE\" >/dev/null 2>&1 || true; ./run_loop.sh'"
+CMD="cd '$APP_DIR' && ./run_loop.sh"
 log "Starting screen session '${NAME}' with command: $CMD"
 if screen -dmS "${NAME}" bash -lc "$CMD"; then
   log "screen session '${NAME}' started (detached)."
@@ -85,7 +73,7 @@ if screen -ls | grep -q "\.${NAME}\s"; then
   log "OK: screen session '${NAME}' is listed by screen -ls."
 else
   log "ERROR: screen session '${NAME}' not found after start."
-  log "Hint: check $LOG and croquettes.err.log for runtime errors."
+  log "Hint: check $LOG for runtime errors."
   exit 1
 fi
 

@@ -257,8 +257,13 @@ def main():
                 error_notified = True
 
         # Sleep until next run (accounting for elapsed time)
+        from datetime import datetime
+
         next_update_time = time.time() + INTERVAL_SECONDS
-        print(f"[INFO] Next run scheduled at {next_update_time}", file=sys.stderr)
+        next_update_str = datetime.fromtimestamp(next_update_time).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        print(f"[INFO] Next run scheduled at {next_update_str}", file=sys.stderr)
         elapsed = time.time() - loop_start
         sleep_s = max(1, INTERVAL_SECONDS - int(elapsed))
         time.sleep(sleep_s)

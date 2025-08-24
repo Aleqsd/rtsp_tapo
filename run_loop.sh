@@ -2,22 +2,30 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Load environment variables from ~/.bashrc if needed
-# Uncomment if your API keys are only in ~/.bashrc:
-# source "$HOME/.bashrc"
+LOG_ERR="croquettes.err.log"
+LOG_OUT="croquettes.out.log"
+ENV_FILE="$HOME/.croquettes_env"
 
-# Sanity checks to ensure required env vars are present
-: "${OPEN_AI_API_KEY:?Missing OPEN_AI_API_KEY}"
-: "${RTSP_TAPO_USER:?Missing RTSP_TAPO_USER}"
-: "${RTSP_TAPO_PASSWORD:?Missing RTSP_TAPO_PASSWORD}"
-: "${RTSP_TAPO_IP:?Missing RTSP_TAPO_IP}"
-: "${TELEGRAM_BOT_TOKEN:?Missing TELEGRAM_BOT_TOKEN}"
-: "${TELEGRAM_CHAT_ID:?Missing TELEGRAM_CHAT_ID}"
+log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG_ERR" ; }
 
-# Infinite loop to auto-restart the bot if it crashes
+log "==== run_loop.sh invoked ===="
+
+# Load environment variables if available
+if [ -f "$ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  log "Environment file $ENV_FILE loaded."
+else
+  log "WARN: environment file $ENV_FILE not found, relying on inherited env."
+fi
+
+# Infinite loop to auto-restart main.py
 while true; do
-  date -Iseconds >> croquettes.err.log
-  python3 main.py >> croquettes.out.log 2>> croquettes.err.log || true
-  echo "crash/restart in 10s" >> croquettes.err.log
+  log "Launching main.py…"
+  if python3 main.py >> "$LOG_OUT" 2>> "$LOG_ERR"; then
+    log "main.py exited normally (unexpected, restarting in 10s)."
+  else
+    log "main.py crashed or returned non-zero, restarting in 10s."
+  fi
   sleep 10
 done

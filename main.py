@@ -138,6 +138,7 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
         "Count the number of individual kibbles in this bowl. "
         "If some overlap, estimate as best as possible. "
         "Respond with a single integer only. No words, no units."
+        "You will only respond with text if there's an error."
     )
 
     resp = _openai_client.chat.completions.create(
@@ -155,8 +156,6 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
                 ],
             },
         ],
-        max_tokens=8,
-        temperature=0,
     )
     text = (resp.choices[0].message.content or "").strip()
     if not text:

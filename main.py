@@ -2,6 +2,7 @@ import sys
 import time
 import os
 import re
+import glob
 import base64
 import cv2
 import requests
@@ -22,9 +23,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 RTSP_TAPO_PORT = os.getenv("RTSP_TAPO_PORT", "554")
 RTSP_TAPO_STREAM = os.getenv("RTSP_TAPO_STREAM", "stream1")  # stream1 or stream2
 ANALYZE_AFTER = float(os.getenv("ANALYZE_AFTER", "5"))  # seconds before capture
-INTERVAL_SECONDS = int(
-    os.getenv("INTERVAL_SECONDS", "3600")
-)  # interval between runs (default 1h)
+INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "3600"))  # default 1h
 THRESHOLD = int(os.getenv("THRESHOLD", "30"))  # notify if < THRESHOLD
 NO_FFMPEG = os.getenv("NO_FFMPEG", "0").lower() in ("1", "true", "yes")
 
@@ -123,6 +122,53 @@ def pil_to_data_url(pil_img: Image.Image) -> str:
     return f"data:image/png;base64,{b64}"
 
 
+def _ensure_dir(path: str):
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def _save_and_prune_last_images(
+    pil_img: Image.Image, out_dir: str = "last_images", keep: int = 3
+) -> str:
+    """
+    Save the current PIL image into `out_dir` with a timestamped filename,
+    then prune to keep only the newest `keep` images (delete older ones).
+    Returns the saved path.
+    """
+    _ensure_dir(out_dir)
+    ts = int(time.time())
+    filename = f"frame_{ts}.png"
+    path = os.path.join(out_dir, filename)
+
+    try:
+        pil_img.save(path)
+        print(f"[INFO] Saved debug image: {path}", file=sys.stderr)
+    except Exception as e:
+        print(f"[WARN] Failed to save debug image: {e}", file=sys.stderr)
+        return ""
+
+    try:
+        # List all PNGs and sort by mtime ascending (oldest first)
+        files = sorted(
+            glob.glob(os.path.join(out_dir, "*.png")), key=lambda p: os.path.getmtime(p)
+        )
+        # If more than `keep`, remove oldest extras
+        if len(files) > keep:
+            to_remove = files[0 : len(files) - keep]
+            for old in to_remove:
+                try:
+                    os.remove(old)
+                    print(f"[INFO] Pruned old image: {old}", file=sys.stderr)
+                except Exception as e:
+                    print(
+                        f"[WARN] Failed to remove old image {old}: {e}", file=sys.stderr
+                    )
+    except Exception as e:
+        print(f"[WARN] Prune step failed: {e}", file=sys.stderr)
+
+    return path
+
+
 def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
     """Send the image to GPT-5 nano and return a single integer."""
     # Downscale in-memory (no file save)
@@ -169,7 +215,10 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
 def capture_and_count(
     rtsp_url: str, analyze_after: float, use_ffmpeg: bool = True
 ) -> int:
-    """Open RTSP, wait N seconds, capture one frame, count kibbles, then close."""
+    """
+    Open RTSP, wait N seconds, capture one frame, save it in last_images/,
+    count kibbles, then close.
+    """
     cap = open_capture(rtsp_url, use_ffmpeg=use_ffmpeg)
     if not cap.isOpened():
         raise RuntimeError("Failed to open RTSP stream")
@@ -186,7 +235,12 @@ def capture_and_count(
             if time.time() - start_t >= analyze_after:
                 frame = f
                 break
+
         pil_img = bgr_to_pil(frame)
+
+        # 🖼️ Save and prune last 3 images for logs
+        _save_and_prune_last_images(pil_img, out_dir="last_images", keep=3)
+
         count = count_kibbles_with_gpt5_nano(pil_img)
         return count
     finally:

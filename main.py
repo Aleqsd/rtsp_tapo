@@ -205,7 +205,7 @@ def main():
     use_ffmpeg = not NO_FFMPEG
 
     print(
-        f"[INFO] Service started. RTSP={rtsp_url} "
+        f"[INFO] Service started. {rtsp_url} "
         f"interval={INTERVAL_SECONDS}s threshold<{THRESHOLD} analyze_after={ANALYZE_AFTER}s",
         file=sys.stderr,
     )
@@ -226,7 +226,6 @@ def main():
         loop_start = time.time()
         try:
             count = capture_and_count(rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg)
-            print(count)  # stdout for logging/metrics
             print(
                 f"[INFO] Count={count} (threshold={THRESHOLD}, low_notified={low_notified})",
                 file=sys.stderr,
@@ -258,6 +257,8 @@ def main():
                 error_notified = True
 
         # Sleep until next run (accounting for elapsed time)
+        next_update_time = time.time() + INTERVAL_SECONDS
+        print(f"[INFO] Next run scheduled at {next_update_time}", file=sys.stderr)
         elapsed = time.time() - loop_start
         sleep_s = max(1, INTERVAL_SECONDS - int(elapsed))
         time.sleep(sleep_s)

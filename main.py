@@ -6,6 +6,7 @@ import glob
 import base64
 import cv2
 import requests
+import argparse
 from PIL import Image
 import numpy as np
 from datetime import datetime, timedelta
@@ -307,6 +308,14 @@ def capture_and_count(
 
 # ================== MAIN LOOP ==================
 def main():
+    parser = argparse.ArgumentParser(description="Kibbles counter service.")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="One-shot test: capture a frame now and send a Telegram photo (ignores quiet hours and threshold).",
+    )
+    args = parser.parse_args()
+
     rtsp_url = build_rtsp_url(
         ip=RTSP_TAPO_IP,
         port=RTSP_TAPO_PORT,
@@ -332,6 +341,26 @@ def main():
         sys.exit(1)
     test_cap.release()
 
+    # ---------- TEST MODE ----------
+    if args.test:
+        try:
+            count, img_path = capture_and_count(
+                rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg
+            )
+            print(
+                f"[TEST] Forcing Telegram photo with count={count} path={img_path}",
+                file=sys.stderr,
+            )
+            send_telegram_count(count, image_path=img_path)
+            print("[TEST] Done.", file=sys.stderr)
+            return
+        except Exception as e:
+            err_txt = f"TEST failed: {e}"
+            print(f"[ERROR] {err_txt}", file=sys.stderr)
+            send_telegram_error(err_txt)
+            sys.exit(1)
+
+    # ---------- REGULAR LOOP ----------
     low_notified = False  # anti-spam latch for threshold
     error_notified = False  # anti-spam latch for errors
 

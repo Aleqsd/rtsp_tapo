@@ -8,6 +8,16 @@ import cv2
 import requests
 from PIL import Image
 import numpy as np
+from datetime import datetime, timedelta
+
+# Try to use IANA timezone "Europe/Paris" (fallback to system local time if unavailable)
+try:
+    from zoneinfo import ZoneInfo
+
+    TZ = ZoneInfo(os.getenv("TZ", "Europe/Paris"))
+except Exception:
+    TZ = None  # fallback to naive localtime
+
 from openai import OpenAI
 
 # ================== ENV CONFIG ==================
@@ -26,6 +36,10 @@ ANALYZE_AFTER = float(os.getenv("ANALYZE_AFTER", "5"))  # seconds before capture
 INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "3600"))  # default 1h
 THRESHOLD = int(os.getenv("THRESHOLD", "30"))  # notify if < THRESHOLD
 NO_FFMPEG = os.getenv("NO_FFMPEG", "0").lower() in ("1", "true", "yes")
+
+# Quiet hours window (inclusive start, exclusive end)
+QUIET_START_HOUR = int(os.getenv("QUIET_START_HOUR", "22"))  # 22:00
+QUIET_END_HOUR = int(os.getenv("QUIET_END_HOUR", "8"))  # 08:00
 
 # Check required env vars
 missing = [
@@ -51,21 +65,66 @@ _openai_client = OpenAI(api_key=OPEN_AI_API_KEY)
 
 
 # ================== HELPERS ==================
-def send_telegram_count(count: int):
-    """Send a Telegram notification with the kibble count."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    msg = f"Il reste {count} croquettes 🐾"
-    try:
-        r = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "disable_notification": False,
-            },
+def now_tz() -> datetime:
+    """Get current datetime in configured timezone (or local naive if TZ missing)."""
+    return datetime.now(TZ) if TZ else datetime.now()
+
+
+def in_quiet_hours(dt: datetime) -> bool:
+    """Return True if current time is within [QUIET_START_HOUR, next day QUIET_END_HOUR)."""
+    h = dt.hour
+    if QUIET_START_HOUR <= h or h < QUIET_END_HOUR:
+        return True
+    return False
+
+
+def seconds_until_quiet_end(dt: datetime) -> int:
+    """Compute seconds until the next QUIET_END_HOUR (today if not passed, else tomorrow)."""
+    target = dt.replace(hour=QUIET_END_HOUR, minute=0, second=0, microsecond=0)
+    if dt.hour >= QUIET_END_HOUR:
+        target = target + timedelta(days=1)
+    return max(1, int((target - dt).total_seconds()))
+
+
+def send_telegram_count(count: int, image_path: str | None = None):
+    """Send a Telegram notification with kibble count, including photo if available."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(
+            "[WARN] Telegram env vars not set; skipping notification.", file=sys.stderr
         )
+        return
+
+    caption = f"Il reste {count} croquettes 🐾"
+    try:
+        if image_path and os.path.isfile(image_path):
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            with open(image_path, "rb") as f:
+                files = {"photo": f}
+                data = {
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption,
+                    "disable_notification": False,
+                }
+                r = requests.post(url, data=data, files=files, timeout=20)
+        else:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            r = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": caption,
+                    "disable_notification": False,
+                },
+                timeout=20,
+            )
+
         r.raise_for_status()
-        print("[INFO] Telegram notification sent.", file=sys.stderr)
+        print(
+            "[INFO] Telegram notification (with photo)"
+            if image_path
+            else "[INFO] Telegram notification sent.",
+            file=sys.stderr,
+        )
     except Exception as e:
         print(f"[WARN] Telegram notification failed: {e}", file=sys.stderr)
 
@@ -84,6 +143,7 @@ def send_telegram_error(err_msg: str):
                 "text": msg,
                 "disable_notification": False,
             },
+            timeout=20,
         )
         r.raise_for_status()
         print("[INFO] Telegram ERROR notification sent.", file=sys.stderr)
@@ -148,11 +208,9 @@ def _save_and_prune_last_images(
         return ""
 
     try:
-        # List all PNGs and sort by mtime ascending (oldest first)
         files = sorted(
             glob.glob(os.path.join(out_dir, "*.png")), key=lambda p: os.path.getmtime(p)
         )
-        # If more than `keep`, remove oldest extras
         if len(files) > keep:
             to_remove = files[0 : len(files) - keep]
             for old in to_remove:
@@ -214,10 +272,10 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
 
 def capture_and_count(
     rtsp_url: str, analyze_after: float, use_ffmpeg: bool = True
-) -> int:
+) -> tuple[int, str]:
     """
     Open RTSP, wait N seconds, capture one frame, save it in last_images/,
-    count kibbles, then close.
+    count kibbles, then close. Returns (count, saved_image_path).
     """
     cap = open_capture(rtsp_url, use_ffmpeg=use_ffmpeg)
     if not cap.isOpened():
@@ -238,11 +296,11 @@ def capture_and_count(
 
         pil_img = bgr_to_pil(frame)
 
-        # 🖼️ Save and prune last 3 images for logs
-        _save_and_prune_last_images(pil_img, out_dir="last_images", keep=3)
+        # Save and prune last 3 images for logs
+        img_path = _save_and_prune_last_images(pil_img, out_dir="last_images", keep=3)
 
         count = count_kibbles_with_gpt5_nano(pil_img)
-        return count
+        return count, img_path
     finally:
         cap.release()
 
@@ -260,16 +318,17 @@ def main():
 
     print(
         f"[INFO] Service started. {rtsp_url} "
-        f"interval={INTERVAL_SECONDS}s threshold<{THRESHOLD} analyze_after={ANALYZE_AFTER}s",
+        f"interval={INTERVAL_SECONDS}s threshold<{THRESHOLD} analyze_after={ANALYZE_AFTER}s "
+        f"quiet_hours={QUIET_START_HOUR:02d}:00–{QUIET_END_HOUR:02d}:00 TZ={'system' if TZ is None else TZ}",
         file=sys.stderr,
     )
 
-    # ✅ Initial RTSP connectivity check
+    # Initial RTSP connectivity check
     test_cap = open_capture(rtsp_url, use_ffmpeg=use_ffmpeg)
     if not test_cap.isOpened():
         err = "Could not open RTSP stream. Check URL or install ffmpeg: sudo apt install -y ffmpeg"
         print(f"[ERROR] {err}", file=sys.stderr)
-        send_telegram_error(err)  # one-time alert at startup if stream fails
+        send_telegram_error(err)
         sys.exit(1)
     test_cap.release()
 
@@ -277,23 +336,38 @@ def main():
     error_notified = False  # anti-spam latch for errors
 
     while True:
+        # Respect quiet hours before doing anything
+        now = now_tz()
+        if in_quiet_hours(now):
+            sleep_s = seconds_until_quiet_end(now)
+            wake = now + timedelta(seconds=sleep_s)
+            print(
+                f"[INFO] Quiet hours active ({QUIET_START_HOUR:02d}:00–{QUIET_END_HOUR:02d}:00). "
+                f"Sleeping until {wake.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_s)
+            continue
+
         loop_start = time.time()
         try:
-            count = capture_and_count(rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg)
+            count, img_path = capture_and_count(
+                rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg
+            )
             print(
                 f"[INFO] Count={count} (threshold={THRESHOLD}, low_notified={low_notified})",
                 file=sys.stderr,
             )
 
-            # ✅ Successful cycle resets error latch
+            # Successful cycle clears error latch
             if error_notified:
                 print("[INFO] Recovery: clearing error latch.", file=sys.stderr)
             error_notified = False
 
-            # Threshold notification (anti-spam)
+            # Threshold notification (anti-spam), include photo
             if count < THRESHOLD:
                 if not low_notified:
-                    send_telegram_count(count)
+                    send_telegram_count(count, image_path=img_path)
                     low_notified = True
             else:
                 if low_notified:
@@ -310,14 +384,14 @@ def main():
                 send_telegram_error(err_txt)  # one-time notification until recovery
                 error_notified = True
 
-        # Sleep until next run (accounting for elapsed time)
-        from datetime import datetime
-
-        next_update_time = time.time() + INTERVAL_SECONDS
-        next_update_str = datetime.fromtimestamp(next_update_time).strftime(
-            "%Y-%m-%d %H:%M:%S"
+        # Sleep until next run (unless we’re entering quiet hours during sleep)
+        next_run_dt = now_tz() + timedelta(seconds=INTERVAL_SECONDS)
+        print(
+            f"[INFO] Next regular run scheduled at {next_run_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+            file=sys.stderr,
         )
-        print(f"[INFO] Next run scheduled at {next_update_str}", file=sys.stderr)
+
+        # If the next run would fall inside quiet hours, we’ll handle it at loop start.
         elapsed = time.time() - loop_start
         sleep_s = max(1, INTERVAL_SECONDS - int(elapsed))
         time.sleep(sleep_s)

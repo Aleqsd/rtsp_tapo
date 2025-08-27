@@ -10,6 +10,22 @@ log() { echo "[$(date -Iseconds)] $*" | tee -a "$LOG" ; }
 
 log "==== start_screen.sh invoked ===="
 
+# Load environment variables
+if [ -f /etc/environment ]; then
+  log "Loading /etc/environment…"
+  set -o allexport
+  source /etc/environment
+  set +o allexport
+fi
+
+# Also load local .env if it exists (handy for dev)
+if [ -f "$APP_DIR/.env" ]; then
+  log "Loading $APP_DIR/.env…"
+  set -o allexport
+  source "$APP_DIR/.env"
+  set +o allexport
+fi
+
 # Wait a bit for the network to be ready after boot
 log "Sleeping 15s to wait for network…"
 sleep 15

@@ -3,6 +3,7 @@ import time
 import os
 import glob
 import base64
+import csv
 import cv2
 import requests
 import argparse
@@ -34,12 +35,22 @@ RTSP_TAPO_PORT = os.getenv("RTSP_TAPO_PORT", "554")
 RTSP_TAPO_STREAM = os.getenv("RTSP_TAPO_STREAM", "stream1")  # stream1 or stream2
 ANALYZE_AFTER = float(os.getenv("ANALYZE_AFTER", "5"))  # seconds before capture
 INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "3600"))  # default 1h
-THRESHOLD = int(os.getenv("THRESHOLD", "30"))  # notify if < THRESHOLD
 NO_FFMPEG = os.getenv("NO_FFMPEG", "0").lower() in ("1", "true", "yes")
 
 # Quiet hours window (inclusive start, exclusive end)
 QUIET_START_HOUR = int(os.getenv("QUIET_START_HOUR", "22"))  # 22:00
 QUIET_END_HOUR = int(os.getenv("QUIET_END_HOUR", "8"))  # 08:00
+
+# History & weekly report
+HISTORY_PATH = os.getenv("HISTORY_PATH", "history.csv")
+WEEKLY_REPORT_DAY = int(
+    os.getenv("WEEKLY_REPORT_DAY", "6")
+)  # 0=Mon .. 6=Sun (default Sunday)
+WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "20"))  # 24h format
+WEEKLY_REPORT_MINUTE = int(os.getenv("WEEKLY_REPORT_MINUTE", "0"))
+LAST_REPORT_MARK = os.getenv(
+    "LAST_REPORT_MARK", ".last_weekly_report"
+)  # file to prevent duplicates
 
 # Check required env vars
 missing = [
@@ -86,19 +97,27 @@ def seconds_until_quiet_end(dt: datetime) -> int:
     return max(1, int((target - dt).total_seconds()))
 
 
-def send_telegram_status(enough: bool, image_path: str | None = None):
-    """Send a Telegram notification indicating whether there are enough kibbles."""
+def send_telegram_status(level: str, image_path: str | None = None):
+    """
+    Send a Telegram notification indicating the detected level.
+    level ∈ {"empty","low","ok","full"}.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(
             "[WARN] Telegram env vars not set; skipping notification.", file=sys.stderr
         )
         return
 
-    caption = (
-        "Il reste assez de croquettes 🐾"
-        if enough
-        else "Il faut remettre des croquettes 🐾"
-    )
+    # Friendly caption per level
+    emoji = {"empty": "🚨", "low": "⚠️", "ok": "✅", "full": "🟢"}.get(level, "ℹ️")
+    human = {
+        "empty": "Bol vide — il faut remettre des croquettes",
+        "low": "Niveau bas — à surveiller / ajouter bientôt",
+        "ok": "Assez de croquettes",
+        "full": "Bol bien rempli",
+    }.get(level, f"État: {level}")
+    caption = f"{emoji} {human} 🐾"
+
     try:
         if image_path and os.path.isfile(image_path):
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -123,12 +142,7 @@ def send_telegram_status(enough: bool, image_path: str | None = None):
             )
 
         r.raise_for_status()
-        print(
-            "[INFO] Telegram notification (with photo)"
-            if image_path
-            else "[INFO] Telegram notification sent.",
-            file=sys.stderr,
-        )
+        print("[INFO] Telegram notification sent.", file=sys.stderr)
     except Exception as e:
         print(f"[WARN] Telegram notification failed: {e}", file=sys.stderr)
 
@@ -153,6 +167,21 @@ def send_telegram_error(err_msg: str):
         print("[INFO] Telegram ERROR notification sent.", file=sys.stderr)
     except Exception as e:
         print(f"[WARN] Telegram error notification failed: {e}", file=sys.stderr)
+
+
+def send_telegram_message(text: str):
+    """Utility to send a plain text Telegram message."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        r = requests.post(
+            url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=20
+        )
+        r.raise_for_status()
+        print("[INFO] Telegram message sent.", file=sys.stderr)
+    except Exception as e:
+        print(f"[WARN] Telegram message failed: {e}", file=sys.stderr)
 
 
 def build_rtsp_url(ip: str, port: str, user: str, password: str, stream: str) -> str:
@@ -231,8 +260,17 @@ def _save_and_prune_last_images(
     return path
 
 
-def kibbles_enough_with_gpt5_nano(pil_img: Image.Image, threshold: int) -> bool:
-    """Return True if the model estimates at least `threshold` kibbles are present."""
+# ================== VISION: RICHER LEVEL DETECTION ==================
+def kibbles_level_with_gpt5_nano(pil_img: Image.Image) -> tuple[str, float]:
+    """
+    Return (level, confidence) where:
+      level ∈ {"empty","low","ok","full"} and confidence ∈ [0,1].
+    The model is asked to classify by visual fill ratio:
+      - empty: ~0-10% of bowl area contains kibbles
+      - low:   ~10-30%
+      - ok:    ~30-70%
+      - full:  ~70-100%
+    """
     # Downscale in-memory (no file save)
     max_side = 1024
     w, h = pil_img.size
@@ -242,9 +280,16 @@ def kibbles_enough_with_gpt5_nano(pil_img: Image.Image, threshold: int) -> bool:
 
     data_url = pil_to_data_url(pil_img)
 
+    # Constrain output to a tiny JSON to be robust
     prompt_text = (
-        f"Are there at least {threshold} kibbles in this bowl? "
-        "Answer with 'yes' or 'no' only."
+        "Classify the kibble level in the cat bowl by visual fill ratio.\n"
+        "Use these buckets:\n"
+        "- empty: ~0-10%\n"
+        "- low:   ~10-30%\n"
+        "- ok:    ~30-70%\n"
+        "- full:  ~70-100%\n"
+        'Respond ONLY with a compact JSON like: {"level":"ok","confidence":0.82}\n'
+        "No extra text."
     )
 
     resp = _openai_client.chat.completions.create(
@@ -252,7 +297,7 @@ def kibbles_enough_with_gpt5_nano(pil_img: Image.Image, threshold: int) -> bool:
         messages=[
             {
                 "role": "system",
-                "content": "You are a vision assistant. Respond only with 'yes' or 'no'.",
+                "content": "You are a vision assistant. Output only the required JSON. No explanations.",
             },
             {
                 "role": "user",
@@ -262,23 +307,171 @@ def kibbles_enough_with_gpt5_nano(pil_img: Image.Image, threshold: int) -> bool:
                 ],
             },
         ],
+        temperature=0,
     )
-    text = (resp.choices[0].message.content or "").strip().lower()
-    if not text:
-        raise RuntimeError("Empty response from model")
-    if text in {"yes", "oui"}:
-        return True
-    if text in {"no", "non"}:
+    text = (resp.choices[0].message.content or "").strip()
+
+    # Very defensive JSON parsing
+    level = "ok"
+    conf = 0.5
+    try:
+        import json
+
+        j = json.loads(text)
+        lv = str(j.get("level", "")).lower().strip()
+        if lv in {"empty", "low", "ok", "full"}:
+            level = lv
+        c = float(j.get("confidence", 0.5))
+        if 0.0 <= c <= 1.0:
+            conf = c
+    except Exception:
+        # Fallback heuristic if model surprised us
+        if "empty" in text.lower():
+            level = "empty"
+        elif "low" in text.lower():
+            level = "low"
+        elif "full" in text.lower():
+            level = "full"
+        else:
+            level = "ok"
+        conf = 0.5
+
+    return level, conf
+
+
+# ================== HISTORY ==================
+def _ensure_history_header(path: str):
+    """Create CSV with header if missing."""
+    if not os.path.isfile(path):
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp_iso", "level", "confidence", "image_path"])
+            print(f"[INFO] Created history CSV: {path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Failed to create history CSV: {e}", file=sys.stderr)
+
+
+def append_history(path: str, ts: datetime, level: str, conf: float, image_path: str):
+    """Append one line to CSV history."""
+    _ensure_history_header(path)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([ts.isoformat(), level, f"{conf:.3f}", image_path or ""])
+    except Exception as e:
+        print(f"[WARN] Failed to append history: {e}", file=sys.stderr)
+
+
+def read_history_since(path: str, since: datetime) -> list[dict]:
+    """Read history entries since a given datetime."""
+    if not os.path.isfile(path):
+        return []
+    out: list[dict] = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    ts = datetime.fromisoformat(row["timestamp_iso"])
+                    if TZ and ts.tzinfo is None:
+                        # If CSV had naive timestamps, localize roughly
+                        ts = ts.replace(tzinfo=TZ)
+                except Exception:
+                    continue
+                if ts >= since:
+                    out.append(
+                        {
+                            "timestamp": ts,
+                            "level": row.get("level", "ok"),
+                            "confidence": float(row.get("confidence", "0.5") or 0.5),
+                            "image_path": row.get("image_path", ""),
+                        }
+                    )
+    except Exception as e:
+        print(f"[WARN] Failed to read history: {e}", file=sys.stderr)
+    return out
+
+
+# ================== WEEKLY REPORT ==================
+def _mark_weekly_report_sent(mark_path: str, week_id: str):
+    """Store last week id to avoid duplicates."""
+    try:
+        with open(mark_path, "w", encoding="utf-8") as f:
+            f.write(week_id)
+    except Exception as e:
+        print(f"[WARN] Failed to write weekly mark: {e}", file=sys.stderr)
+
+
+def _read_weekly_report_mark(mark_path: str) -> str | None:
+    if not os.path.isfile(mark_path):
+        return None
+    try:
+        with open(mark_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def current_week_id(dt: datetime) -> str:
+    """Return an identifier like '2025-W35' for the week of dt (ISO week)."""
+    y, w, _ = dt.isocalendar()  # type: ignore
+    return f"{y}-W{int(w):02d}"
+
+
+def is_weekly_report_time(dt: datetime) -> bool:
+    """Return True if dt matches the configured weekly day and time."""
+    if dt.weekday() != WEEKLY_REPORT_DAY:
         return False
-    raise RuntimeError(f"Model did not return yes/no: {text!r}")
+    return (dt.hour == WEEKLY_REPORT_HOUR) and (dt.minute >= WEEKLY_REPORT_MINUTE)
 
 
-def capture_and_check(
+def build_weekly_report_text(dt: datetime) -> str:
+    """Aggregate last 7 days and build a Telegram-friendly summary."""
+    since = dt - timedelta(days=7)
+    entries = read_history_since(HISTORY_PATH, since)
+    if not entries:
+        return "📊 Rapport hebdo: aucun enregistrement sur les 7 derniers jours."
+
+    # Stats
+    total = len(entries)
+    counts = {"empty": 0, "low": 0, "ok": 0, "full": 0}
+    for e in entries:
+        counts[e["level"]] = counts.get(e["level"], 0) + 1
+    alerts = counts["empty"] + counts["low"]
+
+    # Find last state
+    last = sorted(entries, key=lambda x: x["timestamp"])[-1]
+    last_str = last["timestamp"].strftime("%Y-%m-%d %H:%M")
+
+    # Simple streaks: last consecutive non-alerts from the end
+    streak_ok = 0
+    for e in reversed(sorted(entries, key=lambda x: x["timestamp"])):
+        if e["level"] in {"ok", "full"}:
+            streak_ok += 1
+        else:
+            break
+
+    # Build text
+    lines = [
+        "📊 *Rapport hebdo croquettes* (7 derniers jours)",
+        f"- Total vérifications: {total}",
+        f"- Alertes (empty/low): {alerts} ({counts['empty']} empty, {counts['low']} low)",
+        f"- Niveaux *ok/full*: {counts['ok']} ok, {counts['full']} full",
+        f"- Dernier état ({last_str}): {last['level']}",
+        f"- Streak sans alerte (fin de période): {streak_ok}",
+    ]
+    return "\n".join(lines)
+
+
+# ================== CAPTURE + CLASSIFY ==================
+def capture_and_classify(
     rtsp_url: str, analyze_after: float, use_ffmpeg: bool = True
-) -> tuple[bool, str]:
+) -> tuple[str, float, str]:
     """
     Open RTSP, wait N seconds, capture one frame, save it in last_images/,
-    ask the model if enough kibbles remain, then close. Returns (enough, saved_image_path).
+    classify into {empty,low,ok,full}, then close.
+    Returns (level, confidence, saved_image_path).
     """
     cap = open_capture(rtsp_url, use_ffmpeg=use_ffmpeg)
     if not cap.isOpened():
@@ -302,8 +495,9 @@ def capture_and_check(
         # Save and prune last 3 images for logs
         img_path = _save_and_prune_last_images(pil_img, out_dir="last_images", keep=3)
 
-        enough = kibbles_enough_with_gpt5_nano(pil_img, THRESHOLD)
-        return enough, img_path
+        # Vision
+        level, conf = kibbles_level_with_gpt5_nano(pil_img)
+        return level, conf, img_path
     finally:
         cap.release()
 
@@ -314,7 +508,12 @@ def main():
     parser.add_argument(
         "--test",
         action="store_true",
-        help="One-shot test: capture a frame now and send a Telegram photo (ignores quiet hours and threshold).",
+        help="One-shot test: capture a frame now and send a Telegram photo (ignores quiet hours).",
+    )
+    parser.add_argument(
+        "--weekly-now",
+        action="store_true",
+        help="Send the weekly report right now (does not wait for scheduled time).",
     )
     args = parser.parse_args()
 
@@ -329,8 +528,9 @@ def main():
 
     print(
         f"[INFO] Service started. {rtsp_url} "
-        f"interval={INTERVAL_SECONDS}s threshold<{THRESHOLD} analyze_after={ANALYZE_AFTER}s "
-        f"quiet_hours={QUIET_START_HOUR:02d}:00–{QUIET_END_HOUR:02d}:00 TZ={'system' if TZ is None else TZ}",
+        f"interval={INTERVAL_SECONDS}s analyze_after={ANALYZE_AFTER}s "
+        f"quiet_hours={QUIET_START_HOUR:02d}:00–{QUIET_END_HOUR:02d}:00 TZ={'system' if TZ is None else TZ} "
+        f"weekly={WEEKLY_REPORT_DAY}@{WEEKLY_REPORT_HOUR:02d}:{WEEKLY_REPORT_MINUTE:02d}",
         file=sys.stderr,
     )
 
@@ -343,17 +543,22 @@ def main():
         sys.exit(1)
     test_cap.release()
 
+    # Ensure history exists
+    _ensure_history_header(HISTORY_PATH)
+
     # ---------- TEST MODE ----------
     if args.test:
         try:
-            enough, img_path = capture_and_check(
+            level, conf, img_path = capture_and_classify(
                 rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg
             )
+            ts = now_tz()
+            append_history(HISTORY_PATH, ts, level, conf, img_path)
             print(
-                f"[TEST] Forcing Telegram photo with enough={enough} path={img_path}",
+                f"[TEST] Forcing Telegram photo with level={level} conf={conf:.2f} path={img_path}",
                 file=sys.stderr,
             )
-            send_telegram_status(enough, image_path=img_path)
+            send_telegram_status(level, image_path=img_path)
             print("[TEST] Done.", file=sys.stderr)
             return
         except Exception as e:
@@ -362,9 +567,18 @@ def main():
             send_telegram_error(err_txt)
             sys.exit(1)
 
+    # ---------- WEEKLY NOW ----------
+    if args.weekly_now:
+        report = build_weekly_report_text(now_tz())
+        send_telegram_message(report)
+        # deliberately continue into loop
+
     # ---------- REGULAR LOOP ----------
-    low_notified = False  # anti-spam latch for threshold
+    low_notified = False  # anti-spam latch for alerts
     error_notified = False  # anti-spam latch for errors
+
+    # Weekly report dedup mark
+    last_week_mark = _read_weekly_report_mark(LAST_REPORT_MARK)
 
     while True:
         # Respect quiet hours before doing anything
@@ -382,31 +596,44 @@ def main():
 
         loop_start = time.time()
         try:
-            enough, img_path = capture_and_check(
+            level, conf, img_path = capture_and_classify(
                 rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg
             )
             print(
-                f"[INFO] Enough={enough} (threshold={THRESHOLD}, low_notified={low_notified})",
+                f"[INFO] Level={level} (conf={conf:.2f}, low_notified={low_notified})",
                 file=sys.stderr,
             )
+
+            # Append to history
+            ts = now_tz()
+            append_history(HISTORY_PATH, ts, level, conf, img_path)
 
             # Successful cycle clears error latch
             if error_notified:
                 print("[INFO] Recovery: clearing error latch.", file=sys.stderr)
             error_notified = False
 
-            # Threshold notification (anti-spam), include photo
-            if not enough:
+            # Notification policy: only alert on "low" or "empty"
+            if level in {"empty", "low"}:
                 if not low_notified:
-                    send_telegram_status(False, image_path=img_path)
+                    send_telegram_status(level, image_path=img_path)
                     low_notified = True
             else:
                 if low_notified:
                     print(
-                        "[INFO] Kibble level back above threshold, reset notification latch.",
+                        "[INFO] Level back to OK/FULL, reset notification latch.",
                         file=sys.stderr,
                     )
                 low_notified = False
+
+            # Weekly report check
+            wk_id = current_week_id(now)
+            if is_weekly_report_time(now) and last_week_mark != wk_id:
+                report = build_weekly_report_text(now)
+                send_telegram_message(report)
+                _mark_weekly_report_sent(LAST_REPORT_MARK, wk_id)
+                last_week_mark = wk_id
+                print(f"[INFO] Weekly report sent for {wk_id}.", file=sys.stderr)
 
         except Exception as e:
             err_txt = str(e)
@@ -422,7 +649,6 @@ def main():
             file=sys.stderr,
         )
 
-        # If the next run would fall inside quiet hours, we’ll handle it at loop start.
         elapsed = time.time() - loop_start
         sleep_s = max(1, INTERVAL_SECONDS - int(elapsed))
         time.sleep(sleep_s)

@@ -1,7 +1,6 @@
 import sys
 import time
 import os
-import re
 import glob
 import base64
 import cv2
@@ -87,15 +86,19 @@ def seconds_until_quiet_end(dt: datetime) -> int:
     return max(1, int((target - dt).total_seconds()))
 
 
-def send_telegram_count(count: int, image_path: str | None = None):
-    """Send a Telegram notification with kibble count, including photo if available."""
+def send_telegram_status(enough: bool, image_path: str | None = None):
+    """Send a Telegram notification indicating whether there are enough kibbles."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(
             "[WARN] Telegram env vars not set; skipping notification.", file=sys.stderr
         )
         return
 
-    caption = f"Il reste {count} croquettes 🐾"
+    caption = (
+        "Oui, il reste assez de croquettes 🐾"
+        if enough
+        else "Non, il faut en rajouter 🐾"
+    )
     try:
         if image_path and os.path.isfile(image_path):
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -228,8 +231,8 @@ def _save_and_prune_last_images(
     return path
 
 
-def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
-    """Send the image to GPT-5 nano and return a single integer."""
+def kibbles_enough_with_gpt5_nano(pil_img: Image.Image, threshold: int) -> bool:
+    """Return True if the model estimates at least `threshold` kibbles are present."""
     # Downscale in-memory (no file save)
     max_side = 1024
     w, h = pil_img.size
@@ -240,10 +243,8 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
     data_url = pil_to_data_url(pil_img)
 
     prompt_text = (
-        "Count the number of individual kibbles in this bowl. "
-        "If some overlap, estimate as best as possible. "
-        "Respond with a single integer only. No words, no units."
-        "You will only respond with text if there's an error."
+        f"Are there at least {threshold} kibbles in this bowl? "
+        "Answer with 'yes' or 'no' only."
     )
 
     resp = _openai_client.chat.completions.create(
@@ -251,7 +252,7 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
         messages=[
             {
                 "role": "system",
-                "content": "You are an object counter. Output only a single integer with no words.",
+                "content": "You are a vision assistant. Respond only with 'yes' or 'no'.",
             },
             {
                 "role": "user",
@@ -262,21 +263,22 @@ def count_kibbles_with_gpt5_nano(pil_img: Image.Image) -> int:
             },
         ],
     )
-    text = (resp.choices[0].message.content or "").strip()
+    text = (resp.choices[0].message.content or "").strip().lower()
     if not text:
         raise RuntimeError("Empty response from model")
-    m = re.search(r"-?\d+", text)
-    if not m:
-        raise RuntimeError(f"Model did not return an integer: {text!r}")
-    return int(m.group(0))
+    if text in {"yes", "oui"}:
+        return True
+    if text in {"no", "non"}:
+        return False
+    raise RuntimeError(f"Model did not return yes/no: {text!r}")
 
 
-def capture_and_count(
+def capture_and_check(
     rtsp_url: str, analyze_after: float, use_ffmpeg: bool = True
-) -> tuple[int, str]:
+) -> tuple[bool, str]:
     """
     Open RTSP, wait N seconds, capture one frame, save it in last_images/,
-    count kibbles, then close. Returns (count, saved_image_path).
+    ask the model if enough kibbles remain, then close. Returns (enough, saved_image_path).
     """
     cap = open_capture(rtsp_url, use_ffmpeg=use_ffmpeg)
     if not cap.isOpened():
@@ -300,8 +302,8 @@ def capture_and_count(
         # Save and prune last 3 images for logs
         img_path = _save_and_prune_last_images(pil_img, out_dir="last_images", keep=3)
 
-        count = count_kibbles_with_gpt5_nano(pil_img)
-        return count, img_path
+        enough = kibbles_enough_with_gpt5_nano(pil_img, THRESHOLD)
+        return enough, img_path
     finally:
         cap.release()
 
@@ -344,14 +346,14 @@ def main():
     # ---------- TEST MODE ----------
     if args.test:
         try:
-            count, img_path = capture_and_count(
+            enough, img_path = capture_and_check(
                 rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg
             )
             print(
-                f"[TEST] Forcing Telegram photo with count={count} path={img_path}",
+                f"[TEST] Forcing Telegram photo with enough={enough} path={img_path}",
                 file=sys.stderr,
             )
-            send_telegram_count(count, image_path=img_path)
+            send_telegram_status(enough, image_path=img_path)
             print("[TEST] Done.", file=sys.stderr)
             return
         except Exception as e:
@@ -380,11 +382,11 @@ def main():
 
         loop_start = time.time()
         try:
-            count, img_path = capture_and_count(
+            enough, img_path = capture_and_check(
                 rtsp_url, ANALYZE_AFTER, use_ffmpeg=use_ffmpeg
             )
             print(
-                f"[INFO] Count={count} (threshold={THRESHOLD}, low_notified={low_notified})",
+                f"[INFO] Enough={enough} (threshold={THRESHOLD}, low_notified={low_notified})",
                 file=sys.stderr,
             )
 
@@ -394,14 +396,14 @@ def main():
             error_notified = False
 
             # Threshold notification (anti-spam), include photo
-            if count < THRESHOLD:
+            if not enough:
                 if not low_notified:
-                    send_telegram_count(count, image_path=img_path)
+                    send_telegram_status(False, image_path=img_path)
                     low_notified = True
             else:
                 if low_notified:
                     print(
-                        "[INFO] Count back above threshold, reset notification latch.",
+                        "[INFO] Kibble level back above threshold, reset notification latch.",
                         file=sys.stderr,
                     )
                 low_notified = False

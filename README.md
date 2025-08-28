@@ -38,7 +38,7 @@ Runs on a Freebox Delta VM (Debian) or any Linux machine.
 ## 🔑 Environment Variables
 
 The bot uses environment variables for configuration.  
-Add them to `~/.bashrc` or `~/.profile`:
+Add them to `~/.bashrc` or `/etc/environment`:
 
 ```bash
 export OPENAI_API_KEY="sk-xxx"

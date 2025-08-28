@@ -307,7 +307,6 @@ def kibbles_level_with_gpt5_nano(pil_img: Image.Image) -> tuple[str, float]:
                 ],
             },
         ],
-        temperature=0,
     )
     text = (resp.choices[0].message.content or "").strip()
 

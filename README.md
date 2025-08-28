@@ -1,7 +1,7 @@
 # 🐾 Croquettes Counter Bot
 
-This project uses a Tapo RTSP camera + OpenAI Vision API to **estimate the number of kibbles in a bowl**.  
-It notifies you via Telegram when the number of kibbles drops below a threshold.
+This project uses a Tapo RTSP camera + OpenAI Vision API to **check if a bowl still contains enough kibbles**.
+It notifies you via Telegram when the kibble level drops below a threshold.
 
 Runs on a Freebox Delta VM (Debian) or any Linux machine.
 
@@ -10,9 +10,9 @@ Runs on a Freebox Delta VM (Debian) or any Linux machine.
 ## 📦 Features
 
 - Capture one frame from the RTSP feed every `N` seconds (default: 1h).
-- Send the frame to **OpenAI GPT-5 Nano (vision)** to count kibbles.
-- If count < threshold (default: 30), send a **Telegram notification**.
-- Anti-spam: only notify once until count goes back above threshold.
+- Send the frame to **OpenAI GPT-5 Nano (vision)** to decide whether there are enough kibbles.
+- If the level is below the threshold (default: 30), send a **Telegram notification** with a yes/no message.
+- Anti-spam: only notify once until the kibble level goes back above threshold.
 - Robust logging (all logs in `croquettes.log`).
 - Resilient: auto-restart loop (`run_loop.sh`) and relaunch on reboot (`cron + screen`).
 
@@ -123,7 +123,7 @@ Now the bot will relaunch automatically after every reboot.
 
 ## 🧪 Testing
 
-- To simulate low kibble count, temporarily lower the `--threshold` value in `main.py` or edit your environment variables.
+- To simulate a low kibble level, temporarily lower the `--threshold` value in `main.py` or edit your environment variables.
 - You can check Telegram logs in `croquettes.log` to confirm notifications were sent.
 
 ---

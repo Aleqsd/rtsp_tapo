@@ -95,9 +95,9 @@ def send_telegram_status(enough: bool, image_path: str | None = None):
         return
 
     caption = (
-        "Oui, il reste assez de croquettes 🐾"
+        "Il reste assez de croquettes 🐾"
         if enough
-        else "Non, il faut en rajouter 🐾"
+        else "Il faut remettre des croquettes 🐾"
     )
     try:
         if image_path and os.path.isfile(image_path):
